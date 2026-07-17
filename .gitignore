@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# secrets / env
+.env
+*.env
+
+# model weights / caches (never commit)
+*.safetensors
+*.gguf
+*.bin
+models/
+weights/
+.cache/
+hf_cache/
+
+# logs / benchmarks
+*.log
+bench_out/
