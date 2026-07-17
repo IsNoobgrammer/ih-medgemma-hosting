@@ -103,4 +103,4 @@ python -m sglang.launch_server \
 - Verify RTX 6000 bandwidth vs exact SKU (1,792 WS vs 1,597 Server).
 
 ## Sources
-Full research report (charts + all source links): `S:\Users\shaur\researcher\medgemma-27b-serving_18_JUL_2026\index.html`. Key: Gemma 3 tech report (arXiv 2503.19786), MedGemma tech report (2507.05201), vLLM FP8-KV blog (2026-04-22), SGLang docs + #22277, RedHatAI FP8/W4A16 quants, NVIDIA L40 / RTX PRO 6000 datasheets.
+Full research report (charts + all source links): `C:\Users\shaur\researcher\medgemma-27b-serving_18_JUL_2026\index.html`. Key: Gemma 3 tech report (arXiv 2503.19786), MedGemma tech report (2507.05201), vLLM FP8-KV blog (2026-04-22), SGLang docs + #22277, RedHatAI FP8/W4A16 quants, NVIDIA L40 / RTX PRO 6000 datasheets.
