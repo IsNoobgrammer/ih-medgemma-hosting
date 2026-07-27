@@ -1,6 +1,6 @@
 # ih-medgemma-hosting
 
-Serving **MedGemma 27B** in production. Prototype/validate on **RTX PRO 6000 Blackwell WS (96 GB)**, ship on **NVIDIA L40 (48 GB)**.
+Serving **MedGemma 27B** in production. Prototyped on **RTX PRO 6000 Blackwell (96 GB, molab)**, shipping on **1 × NVIDIA L40S (48 GB)** via **Shakti Studio (Yotta)** BYOC containers.
 
 > Working doc + project constitution. Update it as decisions change. Research compiled 2026-07-18; re-verify version-specific claims before relying on them.
 
@@ -13,7 +13,40 @@ Serving **MedGemma 27B** in production. Prototype/validate on **RTX PRO 6000 Bla
 - **Attention backend: Triton** (`--attention-backend triton`) — arch-generic, JIT-compiles for sm_89, and is the path SGLang uses to serve Gemma FP8-KV. **NOT FlashInfer** (see traps).
 - **Prefix caching: ON** (SGLang RadixAttention, default) — biggest safe TTFT win.
 
-## Must validate on the real L40 before prod (non-negotiable)
+## Deployment platform — Shakti Studio (Yotta)  [status: 2026-07-27]
+
+Console `shaktistudio.ai`, org **Intelehealth Inc**. Two separate concepts — do not conflate:
+**Models** (register the container: image, port, health, command, GPU count) → **Deployments** (pick that model + **Accelerator Type** + scaling).
+
+**Accelerators offered: `H100` and `L40S` only. No L4** — and L4 (24 GB) could not hold 27B at FP8 (~27 GB) anyway. L40S is Ada `sm_89`, same 48 GB as L40 but ~2× FP8 compute, so all L40 research transfers (including the sm_89 FP8-KV risk).
+The accelerator **quantity follows the model's `GPU Per Container`** — ours is 1, so the option is `1 × L40S`. (Marketplace Gemma 3 27B forces `2 ×` because it is BF16 ~54 GB.)
+
+### BYOC model — CREATED & VERIFIED (not yet deployed)
+- Name `medgemma-27b-sglang-fp8` · **Model ID `d4e8fa0b-742b-4281-9ce0-6824377c37f6`** · Status Success, image pull "Access verified"
+- Image **`lmsysorg/sglang:v0.5.16-cu129`** (public Docker Hub, no registry creds). cu129 over cu130 = tolerates older node drivers.
+- GPU Per Container **1** · HTTP **8000** (Public Access on) · Health `/health:8000`, delay 30s, threshold 300, period 10s, timeout 5s (≈50 min grace — needed for the 51 GB download) · Model Endpoint `/v1/chat/completions`
+- Env: `HF_TOKEN`, `HF_XET_HIGH_PERFORMANCE=1` (hf_transfer is deprecated → Xet)
+- Command override:
+  `python3 -m sglang.launch_server --model-path google/medgemma-27b-text-it --quantization fp8 --kv-cache-dtype fp8_e4m3 --attention-backend triton --context-length 65536 --mem-fraction-static 0.85 --host 0.0.0.0 --port 8000`
+  (**`--host 0.0.0.0`**, not 127.0.0.1 — must be reachable inside the cluster.)
+
+### ⛔ BLOCKER: zero GPU quota
+`Quota Exceeded` on **both** L40S and H100; min/max pods collapse to 0. Quota request raised with Yotta — deploy is parked until granted.
+
+### Scaling: SCHEDULE-BASED, not scale-to-zero  (decided 2026-07-27)
+Working days, business window ~08:00–20:00. **Open the schedule window ~07:15–07:30**, because scale-up = image pull + ~51 GB HF download + FP8 quantize + CUDA-graph capture ≈ **15–40 min**; the pod is NOT ready at 08:00. ~60 h/week vs 168 h ≈ **64% cheaper** than always-on. Max pods **1** for tests — the form defaults to **4**, which would bill 4 GPUs.
+**Consequence: do NOT bake weights into a custom image.** One cold start per day makes a once-daily download tolerable; a ~60 GB custom image + Depot build pipeline is not worth it. Keep the thin official image.
+Verify when quota lands: (1) **schedule timezone** (UTC vs IST — 08:00 IST = 02:30 UTC); (2) whether scale-down **drains in-flight requests**.
+
+### Deferred optimizations
+- **Pre-quantize to FP8 offline** → payload 51 → ~27 GB, halves the daily download AND removes load-time quantization (de-risks 48 GB OOM). Worth doing, not a prerequisite.
+- **Persistent volume / model cache**: BYOC exposes no volume mount and docs are silent. Ask Yotta whether a PVC at the HF cache path is possible — the actually-correct fix.
+- Build infra if we ever do bake weights: **Depot** (a supported BYOC registry, remote builds) or a Yotta VM. Local build/push of 60 GB is impractical; molab cannot run Docker at all (no `CAP_SYS_ADMIN`, read-only cgroups).
+
+### 🔒 Security note
+The marketplace model page renders a **live org API JWT** in its sample code (serverless endpoint auth). Treat as a secret; rotate if that page has been screenshotted/shared.
+
+## Must validate on the real L40S before prod (non-negotiable)
 FP8 KV attention is the **sm_89 (Ada) soft spot**. It works on the Blackwell proto (sm_90+ kernels) and *may fault or silently misbehave on the L40*. This is the #1 thing the prototype **cannot** validate for us.
 1. **FP8-KV on L40 runs clean** with SGLang + Triton backend (watch for the SGLang #22277-class Triton dtype-mismatch on Gemma hybrid attention).
 2. **Memory fit** at 64k context / target concurrency on 48 GB (96 GB proto hides OOM).
