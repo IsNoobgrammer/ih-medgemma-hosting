@@ -30,8 +30,53 @@ The accelerator **quantity follows the model's `GPU Per Container`** — ours is
   `python3 -m sglang.launch_server --model-path google/medgemma-27b-text-it --quantization fp8 --kv-cache-dtype fp8_e4m3 --attention-backend triton --context-length 65536 --mem-fraction-static 0.85 --host 0.0.0.0 --port 8000`
   (**`--host 0.0.0.0`**, not 127.0.0.1 — must be reachable inside the cluster.)
 
-### ⛔ BLOCKER: zero GPU quota
-`Quota Exceeded` on **both** L40S and H100; min/max pods collapse to 0. Quota request raised with Yotta — deploy is parked until granted.
+### ✅ QUOTA GRANTED (2026-07-28) — the zero-quota blocker is cleared
+Yotta granted **2 × L40S and 2 × H100**. The accelerator dropdown now offers `1 × H100` and `1 × L40S` with no `Quota Exceeded` label; the form caps **Maximum Pods ≤ 2** and reports `GPU Scaling Capacity: 1 - 2 GPUs`. We only need 1.
+
+### ⛔ FIRST DEPLOYMENT FAILED — two hard blockers found (2026-07-28). Deployment deleted.
+
+**1. Online FP8 quantization cannot work on a 48 GB card. `--quantization fp8` needs ~51 GiB of BF16 headroom first.**
+```
+Load weight begin. avail mem=44.02 GB
+  fp8.py:539 create_weights → data=torch.empty(...)
+torch.OutOfMemoryError: Tried to allocate 442.00 MiB.
+GPU 0 has a total capacity of 44.53 GiB of which 260.75 MiB is free
+```
+`create_weights` runs **before any weight is read from disk** — it only allocates empty parameter tensors. SGLang's `Fp8LinearMethod` allocates FP8 **only if the checkpoint is already FP8-serialized**; otherwise it allocates `params_dtype` (BF16), loads BF16, then compresses in `process_weights_after_loading`. `google/medgemma-27b-text-it` is a BF16 checkpoint → peak demand ≈ **51 GiB**, not the ~26 GiB of FP8 we sized for. It died at 43.69 GiB, ~85% through the 62 decoder layers. FP8 was never reached. Crashlooped 3× then was deleted.
+→ **A pre-quantized FP8 checkpoint is a PREREQUISITE for L40S, not an optimization.** (Was filed under "Deferred optimizations" — wrong call; the OOM risk noted there is the whole ballgame.) On an 80 GB H100 the BF16 transient fits, so online FP8 works there — L40S is the constrained case.
+**Agreed plan (2026-07-28): pre-quantize MedGemma-27B to FP8-dynamic on an RTX 6000, publish to a private HF repo, point the model record's `--model-path` at it.** FP8-dynamic is data-free (no calibration set). Access to the box pending.
+
+**2. Hybrid sliding-window KV is NOT supported for the text-only Gemma 3 class — our KV/concurrency math was ~6× optimistic.**
+```
+Disable hybrid SWA memory for Gemma3ForCausalLM as it is not yet supported.
+→ server_args: disable_hybrid_swa_memory=True
+```
+All **62** layers cache the full context, not just the ~10 global ones. At 64K with FP8 KV (2 × 16 KV heads × 128 head_dim × 1 B = 4 KB/token/layer):
+
+| | KV for one 64K sequence |
+|---|---|
+| Assumed (hybrid SWA working) | ~2.8 GB (10 global full + 52 local × 1024 window) |
+| **Actual (SWA disabled)** | **~16.6 GB** (62 × 254 KB/token) |
+
+This invalidates the "~18–20 concurrent @ 64k" estimate in *Batching math* below — on a 48 GB L40S it is roughly **one** request at full context. **Open: does `medgemma-27b-it` (multimodal, `Gemma3ForConditionalGeneration`) get hybrid SWA where `Gemma3ForCausalLM` does not?** If so that flips the variant choice, since the KV saving would outweigh the extra vision params. Check before committing to the text-only variant.
+
+### Deployment config that produced the above (recreate from this)
+| Field | Value |
+|---|---|
+| Name | `medgemma-27b-fp8-test` |
+| Deployment ID | `5ba4faeb-efae-4ad3-95c4-c402ec5c2665` |
+| Short code | `aygjutg9wi` |
+| Endpoint | `https://http.aygjutg9wi.shaktistudio.shakticloud.ai` → `/v1/chat/completions` |
+| Accelerator | **1 × L40S** |
+| Pods | min 1 / max 1 (CPU 80% metric; scale-to-zero OFF, schedule OFF) |
+| Auth | **Enabled** (was default OFF — a public unauthenticated 27B endpoint is an abuse/cost risk) |
+
+Container config inherited cleanly from the model record (port 8000, `/health`, 30s delay / 300 threshold, the FP8 command override, `HF_TOKEN`/`HF_XET_HIGH_PERFORMANCE`). Deploy sequence observed in **Events**: pod scheduled on a GPU node → `istio-init` + `istio/proxyv2` sidecar → cert-manager ACME solver issues TLS for the public host → pull `lmsysorg/sglang:v0.5.16-cu129` → (then the 51 GB HF download + FP8 quantize + CUDA-graph capture). Until a backend is healthy the public host returns **nginx 503** — that is normal, and confirms DNS/TLS/routing are already correct.
+
+Notes for next time: the **Region/accelerator dropdown renders in a portal that screenshots miss** — locate options with `find`, then `scroll_to`. `Maximum Pods` defaults to the quota max (2), so **set it to 1 explicitly** or you bill both GPUs.
+
+### Pricing (⚠️ UNVERIFIED — unit ambiguous, confirm with Yotta before quoting)
+`shakticloud.ai/pricing` lists, under **Serverless → Dedicated Instance** (the tier our BYOC deployment falls in): `1 × 48 GB L40S` **₹3.17** and `1 × 80 GB H100` **₹7.13**. The page's unit note (*"Per Hour, Per Compute"*) sits under a **different** section and the serverless table carries **no unit of its own**. ₹3.17/hour for an L40S is not credible (the same page's VM tier is **₹137/hr** for 1 × L40S and **₹356/hr** for 1 × H100), so the serverless figures are probably per-minute or per-some-other-unit. **Do not build a cost model on them.** Reliable ratio regardless of unit: **H100 ≈ 2.25× the price of L40S**.
 
 ### Scaling: SCHEDULE-BASED, not scale-to-zero  (decided 2026-07-27)
 Working days, business window ~08:00–20:00. **Open the schedule window ~07:15–07:30**, because scale-up = image pull + ~51 GB HF download + FP8 quantize + CUDA-graph capture ≈ **15–40 min**; the pod is NOT ready at 08:00. ~60 h/week vs 168 h ≈ **64% cheaper** than always-on. Max pods **1** for tests — the form defaults to **4**, which would bill 4 GPUs.
@@ -39,7 +84,7 @@ Working days, business window ~08:00–20:00. **Open the schedule window ~07:15�
 Verify when quota lands: (1) **schedule timezone** (UTC vs IST — 08:00 IST = 02:30 UTC); (2) whether scale-down **drains in-flight requests**.
 
 ### Deferred optimizations
-- **Pre-quantize to FP8 offline** → payload 51 → ~27 GB, halves the daily download AND removes load-time quantization (de-risks 48 GB OOM). Worth doing, not a prerequisite.
+- ~~**Pre-quantize to FP8 offline**~~ → **PROMOTED TO PREREQUISITE, see blocker #1 above.** It was never optional on a 48 GB card. (Bonus once done: payload 51 → ~26 GB, halving the daily cold-start download.)
 - **Persistent volume / model cache**: BYOC exposes no volume mount and docs are silent. Ask Yotta whether a PVC at the HF cache path is possible — the actually-correct fix.
 - Build infra if we ever do bake weights: **Depot** (a supported BYOC registry, remote builds) or a Yotta VM. Local build/push of 60 GB is impractical; molab cannot run Docker at all (no `CAP_SYS_ADMIN`, read-only cgroups).
 
@@ -48,8 +93,9 @@ The marketplace model page renders a **live org API JWT** in its sample code (se
 
 ## Must validate on the real L40S before prod (non-negotiable)
 FP8 KV attention is the **sm_89 (Ada) soft spot**. It works on the Blackwell proto (sm_90+ kernels) and *may fault or silently misbehave on the L40*. This is the #1 thing the prototype **cannot** validate for us.
+0. ⛔ **Weights must LOAD at all** — status 2026-07-28: they don't. Online FP8 quant OOMs (blocker #1); needs a pre-quantized checkpoint first. Items 1–4 are untested because the server never started. *(This is exactly the class of failure the 96 GB proto hides — it validated FP8 end-to-end on Blackwell while the 48 GB target cannot even allocate.)*
 1. **FP8-KV on L40 runs clean** with SGLang + Triton backend (watch for the SGLang #22277-class Triton dtype-mismatch on Gemma hybrid attention).
-2. **Memory fit** at 64k context / target concurrency on 48 GB (96 GB proto hides OOM).
+2. **Memory fit** at 64k context / target concurrency on 48 GB (96 GB proto hides OOM) — **now much tighter than planned, see blocker #2.**
 3. **Real TTFT / tok-s** — proto decodes ~2× faster; never set SLAs from it.
 4. **Accuracy of the shipped FP8 artifact** on a MedQA-style eval — confirm the 0.1–0.9% loss actually holds for FP8-KV-everywhere (published near-lossless numbers are FP8 *weights*, and NVFP4 numbers are on Qwen, not MedGemma).
 
@@ -88,6 +134,8 @@ FP8 KV attention is the **sm_89 (Ada) soft spot**. It works on the Blackwell pro
 - RedHatAI ships ready `gemma-3-27b-it` FP8-dynamic + W4A16 quants — mirror the recipe for MedGemma with `llm-compressor`.
 
 ## Batching math (64k context, ~50k shared prefix, FP8 weights + FP8 KV)
+
+> ⚠️ **MEASURED WRONG — the whole section below assumes hybrid SWA works. It does not** (`Gemma3ForCausalLM`, SGLang v0.5.16 — see blocker #2 above). Every KV figure here is ~6× too small and the concurrency estimate ~6× too high. Real number at 64k on L40S is ≈1 concurrent request. **Re-derive after resolving the `-it` vs `-text-it` SWA question; do not quote these numbers.**
 - KV pool on L40 ≈ 43 GB usable − 27 GB weights − ~3 GB overhead ≈ **~15 GB**.
 - KV/token/layer = 2×16×128 = 4 KB (FP8) / 8 KB (BF16). Global layers (~10) cache full seq; local (~52) cache 1024 only.
 - Shared 50k prefix (counted once): ~2 GB. Per unique request tail (14k global + 1024 local window): FP8 ≈ **~0.73 GB**.
