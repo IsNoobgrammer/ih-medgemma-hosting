@@ -1,6 +1,15 @@
 # Mumbai Phase 1 runbook — MedGemma 27B multimodal on Vertex (Agent Console)
 
-**Goal:** a residency-compliant, OpenAI-compatible, prefix-caching MedGemma endpoint on **1 × RTX PRO 6000** in **asia-south1 (Mumbai)**, deployed entirely through the Agent Console, with **scale-to-zero** + a keep-warm schedule.
+> # ⛔ STALE TARGET — READ `gpu-region-cost-perf.md` FIRST
+> **Mumbai + RTX PRO 6000 is impossible.** A real deploy attempt failed with
+> `Machine type "g4-standard-48" is not supported.` — Vertex does not serve the `g4` family in `asia-south1`.
+> The `RTX Pro 6000 = 1` quota row for Mumbai is **meaningless** (quota ≠ availability).
+> A single H100 (`a3-highgpu-*`) **does not exist in either Indian region** either.
+> **Likely correct target: `asia-south2` (Delhi) + 1 × RTX PRO 6000** (quota 0 → needs a QIR).
+> Everything below about the **container spec, args, console fields, proxy and verification steps remains valid** —
+> only the region/GPU choice changed. Swap `asia-south1` → `asia-south2` once the QIR lands.
+
+**Goal:** a residency-compliant, OpenAI-compatible, prefix-caching MedGemma endpoint on **1 × RTX PRO 6000**, deployed entirely through the Agent Console, with **scale-to-zero** + a keep-warm schedule.
 
 **Phase 1 is BF16 — deliberately no quantization.** We measured 35.31 GiB of KV cache available for BF16 27B on this exact GPU in Singapore, so BF16 fits fine. FP8 is Phase 2 (a throughput/memory optimization, not a prerequisite). This gets a correct endpoint live without any GPU-side work.
 
