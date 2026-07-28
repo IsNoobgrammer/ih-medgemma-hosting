@@ -21,14 +21,42 @@ from schema import Extraction                                    # noqa: E402
 from extract_oldcarts import SYSTEM, _clean, _has_complaint      # noqa: E402
 from config import EVAL_CSV, EVAL_NOTE_COL, CHAR_CAP             # noqa: E402
 
-BASE  = os.environ.get("MEDGEMMA_URL", "https://http.aygjutg9wi.shaktistudio.shakticloud.ai").rstrip("/")
+BASE  = os.environ.get("MEDGEMMA_URL", "https://http.riw9sgruhe.shaktistudio.shakticloud.ai").rstrip("/")
 TOKEN = os.environ.get("MEDGEMMA_TOKEN", "")
-MODEL = "google/medgemma-27b-text-it"
+# vLLM's --served-model-name, NOT the HF repo id. Must match /v1/models exactly or vLLM 404s.
+MODEL = os.environ.get("MEDGEMMA_MODEL", "medgemma-27b-fp8")
 
 # ponytail: pydantic emits $defs/$ref; xgrammar handles refs. If it ever rejects them,
 # inline with jsonref rather than hand-maintaining a second copy of the schema.
+def _strict(node):
+    """Force every property to be required.
+
+    WHY: every field in Extraction has a default (default_factory=list / None), so pydantic
+    emits `required: []`. Guided decoding is then free to close the object immediately -- and
+    it does: the first run returned `{"patient_history": [], "family_history": []}` in 17
+    tokens, schema-VALID but empty. Requiring all keys forces the model to emit each one
+    (nullable fields can still be null, which is a deliberate signal in this schema).
+    """
+    if isinstance(node, dict):
+        if node.get("type") == "object" and "properties" in node:
+            node["required"] = list(node["properties"])
+        for v in node.values():
+            _strict(v)
+    elif isinstance(node, list):
+        for v in node:
+            _strict(v)
+    return node
+
+_JSON_SCHEMA = _strict(Extraction.model_json_schema())
 _SCHEMA = {"type": "json_schema",
-           "json_schema": {"name": "Extraction", "schema": Extraction.model_json_schema()}}
+           "json_schema": {"name": "Extraction", "schema": _JSON_SCHEMA}}
+
+# Gemini got the schema out-of-band via response_schema, so SYSTEM's "the given JSON schema"
+# resolved to something. vLLM's response_format only CONSTRAINS decoding -- it never shows the
+# model the field names. Without this block the model invents its own keys (patient_info,
+# chief_complaint, ...) even though it extracts the content correctly.
+_SCHEMA_BLOCK = ("JSON SCHEMA -- emit exactly these keys and no others; use [] or null when absent:\n"
+                 + json.dumps(_JSON_SCHEMA, separators=(",", ":")) + "\n\n")
 
 
 def _headers():
@@ -47,13 +75,16 @@ def extract(note: str, retries: int = 3, temperature: float = 0.0) -> tuple[Extr
     """Same contract as src.extract_oldcarts.extract, against MedGemma. Returns (extraction, stats)."""
     want = _has_complaint(note)
     last = None
+    # inject the schema right before the NOTE section (SYSTEM ends with "NOTE:\n")
+    prompt = SYSTEM.replace("NOTE:\n", _SCHEMA_BLOCK + "NOTE:\n") + note[:CHAR_CAP]
+    assert _SCHEMA_BLOCK in prompt, "schema block not injected -- SYSTEM prompt shape changed"
     for attempt in range(retries):
         try:
             t0 = time.time()
             r = requests.post(
                 f"{BASE}/v1/chat/completions", headers=_headers(), timeout=300,
                 json={"model": MODEL,
-                      "messages": [{"role": "user", "content": SYSTEM + note[:CHAR_CAP]}],
+                      "messages": [{"role": "user", "content": prompt}],
                       "temperature": temperature if attempt == 0 else 0.2,
                       "max_tokens": 2048,
                       "response_format": _SCHEMA})

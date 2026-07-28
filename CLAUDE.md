@@ -6,9 +6,62 @@ Serving **MedGemma 27B** in production. Prototyped on **RTX PRO 6000 Blackwell (
 
 ---
 
+## ✅ LIVE IN PROD-SHAPE (2026-07-28) — vLLM on 1×L40S, FP8, hybrid SWA confirmed
+
+| | |
+|---|---|
+| Endpoint | `https://http.riw9sgruhe.shaktistudio.shakticloud.ai` → `/v1/chat/completions` |
+| Deployment | `medgemma-vllm-triton-l40s` · `b5793d5b-7bdc-4ea7-8ac4-815a98376840` |
+| Model record | `medgemma-27b-vllm-fp8-cu129` · `dc51e970-4245-4e61-8042-088e2c3f39ab` |
+| Image | **`vllm/vllm-openai:v0.26.0-cu129`** (NOT `latest` — see trap #1) |
+| Weights | **`fhai50032/medgemma-auto-fp8`** (public) — FP8-dynamic compressed-tensors |
+| Auth | vLLM's own `VLLM_API_KEY` (masked env var), Shakti `Enable Auth` **OFF** |
+| Served name | `medgemma-27b-fp8` (≠ HF repo id — clients must use this) |
+
+```bash
+vllm serve fhai50032/medgemma-auto-fp8 --served-model-name medgemma-27b-fp8 \
+  --attention-backend TRITON_ATTN --kv-cache-dtype fp8_e4m3 \
+  --max-model-len 65536 --gpu-memory-utilization 0.92 --max-num-seqs 4 \
+  --dtype bfloat16 --host 0.0.0.0 --port 8000
+```
+
+**MEASURED on the real L40S (supersedes every estimate in this file):**
+
+| | Estimated | **Measured** |
+|---|---|---|
+| Weights in VRAM | ~26 GiB | **27.42 GiB** ✅ FP8 branch taken (vs 51 GiB BF16 that OOM'd) |
+| KV pool | ~12–15 GiB | **10.56 GiB** = **188,347 tokens** |
+| Concurrency @ 64K | ~4.4 | **2.87** (vLLM's own `Maximum concurrency` line) |
+| Concurrency @ ~4K (real extraction) | — | **~45** |
+| Single-stream decode | ~32 tok/s roofline | **~20 tok/s** (~60% of roofline) |
+| Cold start | 15–40 min | **~18 min** (888 s of it = HF download) |
+
+**Hybrid SWA IS ACTIVE on vLLM** — two independent proofs: the log emits `Add 8 padding layers, may waste at most 15.38% KV cache memory` (the hybrid-KV-manager marker), and 10.56 GiB → 188,347 tokens = **58.8 KB/token vs 248 KB/token** non-hybrid (62 layers × 4 KB) = **4.2× saving**. Confirmed `Using AttentionBackendEnum.TRITON_ATTN` and `Selected CutlassFP8ScaledMMLinearKernel for CompressedTensorsW8A8Fp8` (real FP8 kernels, not dequantized).
+
+**Verified working:** `/health` 200 · `/v1/models` **401 without token**, 200 with · clinical prompt returns correct reasoning (CAP with pleuritic pain) · OLDCARTS extraction on real NAS_v3 notes **matches Gemini field-for-field**.
+
+### ⚠️ Four traps that cost real deploy cycles — do not repeat
+1. **`vllm/vllm-openai:latest` is cu130 and will NOT run on Shakti's L40S nodes** (host driver reports CUDA **12020** ≈ 535). `RuntimeError: The NVIDIA driver on your system is too old`. Containers bundle the CUDA *runtime*, never the *driver* — no image can fix an old host driver. CUDA has **minor**-version compat within 12.x but **no major**-version compat. **Always pin `-cu129`.**
+2. **`--disable-log-requests` was REMOVED** from vLLM. It's now `--enable-log-requests` (opt-in), so request logging is **off by default** — which is what we want, since prompts are patient notes. Passing the old flag is a hard argparse failure.
+3. **`VLLM_ATTENTION_BACKEND` no longer exists** (absent from `envs.py` in 0.26; `cuda.py` takes `selected_backend` from config). Setting it is a **silent no-op** — you'd keep running FlashInfer while believing otherwise. Use the CLI flag **`--attention-backend TRITON_ATTN`**.
+4. **Shakti `Command Override` REPLACES the entrypoint** (proven: only the bad flag was rejected, not a stray `vllm`). So write the full `vllm serve …` command. Also: **model records are immutable** — only Clone/Delete, no edit.
+
+### Structured output: Gemini `response_schema` ≠ vLLM `response_format`
+The extractor's schema reached Gemini **out-of-band**; vLLM's `response_format` only *constrains* decoding and never **shows** the model the field names. Worse, every `Extraction` field has a default → pydantic emits `required: []` → guided decoding legally returned `{"patient_history":[],"family_history":[]}` in **17 tokens**: schema-VALID but empty. Two fixes, both in `extract_medgemma.py`:
+- `_strict()` walks the schema and marks **every** property required
+- `_SCHEMA_BLOCK` injects the schema JSON into the prompt
+Bonus: that block is a byte-identical ~1.3k-token prefix on every request → exactly the shared-prefix workload vLLM's prefix caching (on by default) is for.
+
+### Open
+- Cold start is **888 s of HF download**; add `HF_TOKEN` env (HF's own log says it lifts rate limits + speed). `hf_transfer` is **not** in vLLM's requirements — setting `HF_HUB_ENABLE_HF_TRANSFER=1` **hard-errors**; `HF_XET_HIGH_PERFORMANCE=1` is safe (ignored if absent).
+- `torch.compile` cache (74 s) lives in `/root/.cache` **inside the container** → re-paid every restart unless a volume is mounted. Ask Yotta about a PVC.
+- 2.87 concurrent @ 64K is short of the 4 target. Levers: `--gpu-memory-utilization 0.96` (~3.3), `--max-model-len 48K` (~3.8) / 32K (~5.7), or H100. Real extraction traffic (~4K) already gives ~45.
+- Stale model records to delete: `1b79f2` (dead flag), `3ebbff` (`latest`→cu130).
+
 ## Decisions locked
 
-- **Engine: SGLang** (over vLLM). Chosen for RadixAttention prefix reuse — our workload is one big shared clinical system prompt across most requests.
+- ⛔ **REVERSED 2026-07-28 — Engine is now vLLM, not SGLang.** SGLang unconditionally disables hybrid sliding-window KV for **every** Gemma 2/3/3n architecture (`arg_groups/overrides.py`, `@_register_for(...)` → `{"disable_hybrid_swa_memory": True}`, driven by a `FIXME` about a **gemma2** CI failure). It is **not overridable**: `resolvable=True` means the override is *permitted to overwrite the user's value*, and `materialize_declarations()` applies it unconditionally at the end of `__post_init__`. Without hybrid SWA, all 62 layers cache full context → 15.5 GiB per 64K sequence → **64K cannot fit on a 48 GB card at all**. vLLM has hybrid SWA on by default (measured 4.2× above) *and* prefix caching, so nothing was lost.
+- ~~**Engine: SGLang** (over vLLM). Chosen for RadixAttention prefix reuse — our workload is one big shared clinical system prompt across most requests.~~ *(vLLM V1 has automatic prefix caching on by default — `enable_prefix_caching=True` confirmed in the live log — so the original reason for SGLang is fully covered.)*
 - **Precision: FP8 weights + FP8 KV cache *everywhere*.** Accepting **0.1–0.9% accuracy loss** as fine. (vLLM's clean global-FP8/local-BF16 mixed cache is NOT the plan; we want FP8 KV on all layers via SGLang.)
 - **Attention backend: Triton** (`--attention-backend triton`) — arch-generic, JIT-compiles for sm_89, and is the path SGLang uses to serve Gemma FP8-KV. **NOT FlashInfer** (see traps).
 - **Prefix caching: ON** (SGLang RadixAttention, default) — biggest safe TTFT win.
