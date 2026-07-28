@@ -22,12 +22,43 @@ AR pulls through and caches in-region — satisfies both the AR requirement and 
 
 **Use upstream `vllm/vllm-openai`, NOT Google's `pytorch-vllm-serve`.** Google's is a fork behind nginx, its Model Garden configs pin `VLLM_USE_V1=0` (which kills prefix caching), and `--quantization`/`--kv-cache-dtype` are unvalidated on it.
 
-### 0b. Weights access test — do this FIRST, it decides the work
-The Model Garden deployments read `gs://vertex-model-garden-restricted-us/medgemma/medgemma-27b-it`. That bucket is **restricted** and not anonymously readable. A *custom* container runs as **your** service account, which probably **cannot** read it.
+### 0b. Weights must be staged — TESTED 2026-07-28, restricted bucket is NOT readable
+Ran in Cloud Shell as `llm@intelehealth.org`:
+```
+$ gsutil ls gs://vertex-model-garden-restricted-us/medgemma/
+AccessDeniedException: 403 llm@intelehealth.org does not have storage.objects.list
+access to the Google Cloud Storage bucket 'vertex-model-garden-restricted-us'
+```
+→ **Only Google's managed one-click deploy can read that bucket. We must host the weights ourselves.**
+(Tested with the human identity; the Vertex deploy SA is a different principal, but an SA in this project is not going to have access the project admin lacks.)
 
-**Test:** `gsutil ls gs://vertex-model-garden-restricted-us/medgemma/medgemma-27b-it` as the deploy SA.
-- **If readable** → Phase 1 is zero-prep, point `--model` straight at it.
-- **If NOT readable** → stage weights yourself (no GPU needed): HF download `google/medgemma-27b-it` → upload to a **single-region `asia-south1`** GCS bucket. ⚠️ Multi-region `asia` does **not** count as a residency match — must be single-region.
+**Environment facts confirmed the same session:**
+| Fact | Value | Consequence |
+|---|---|---|
+| Cloud Shell `$HOME` disk | **4.8 GB** | ❌ cannot stage a ~54 GB model in Cloud Shell |
+| `gs://ih-training-data` | **multi-region, US** | ❌ unusable — wrong continent *and* multi-region |
+| `gs://cloud-ai-platform-c7f8289e-…` | Vertex-managed staging | not for this |
+| Artifact Registry API | **DISABLED** (`SERVICE_DISABLED`) | must be enabled before any AR repo exists |
+
+**So Phase 1 needs a staging job.** Recommended: **Cloud Build** — its default worker has ~100 GB disk and fast egress, it's a managed service (no Compute Engine), and it's one command from Cloud Shell.
+```yaml
+# cloudbuild.yaml  (timeout must be raised; default 10 min is not enough)
+timeout: 3600s
+steps:
+  - name: python:3.12
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q huggingface_hub
+        HF_TOKEN=$$HF_TOKEN HF_XET_HIGH_PERFORMANCE=1 \
+          hf download google/medgemma-27b-it --local-dir /workspace/m
+        gsutil -m cp -r /workspace/m/* gs://$_BUCKET/medgemma-27b-it/
+    secretEnv: ['HF_TOKEN']
+```
+Alternatives: a Vertex AI custom job (also console-allowed, more setup), or the molab RTX PRO 6000 box (fast, but needs a service-account key pushed to a third-party sandbox — **avoid**).
+
+⚠️ The destination **must be a single-region `asia-south1` bucket**. Multi-region `asia` does **not** count as a residency match.
 
 ---
 
@@ -182,8 +213,14 @@ Never ship a service-account key to a client app — it's a long-lived, non-scop
 
 ---
 
+## Actions needed before deploy (each creates/modifies a resource — needs sign-off)
+1. **Enable `artifactregistry.googleapis.com`** (currently disabled).
+2. **Create a single-region `asia-south1` GCS bucket** for weights (e.g. `gs://ih-medgemma-weights-asia-south1`). Existing `ih-training-data` is multi-region US and unusable.
+3. **Enable Cloud Build API** + run the staging job to copy ~54 GB of `google/medgemma-27b-it` into that bucket.
+4. **Create the Artifact Registry repo** in `asia-south1` (remote → Docker Hub, or standard + mirror `vllm/vllm-openai`).
+
 ## Open items
-- [ ] Can the deploy SA read `gs://vertex-model-garden-restricted-us/...`? (decides whether weights staging is needed)
+- [x] ~~Can the deploy SA read `gs://vertex-model-garden-restricted-us/...`?~~ **No — 403. Weights must be staged.**
 - [ ] Does Vertex pull through an AR **remote** repository?
 - [ ] Does the console deploy form expose **min replicas = 0** for a custom-container model? (Model Garden set it on the existing deployment, so s2z is available in this project — but confirm it's offered for custom models)
 - [ ] Exact `vllm/vllm-openai` tag + `vllm serve --help` flag verification
